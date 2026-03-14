@@ -146,48 +146,67 @@ async function main() {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - MAX_AGE_DAYS);
 
+  // Step 1: Purge articles older than MAX_AGE_DAYS (one global query)
+  const { error: purgeErr, count: purgeCount } = await sb
+    .from('stock_news')
+    .delete({ count: 'exact' })
+    .lt('published_at', cutoff.toISOString());
+  if (purgeErr) console.error('Purge greska:', purgeErr.message);
+  else console.log(`Ocisceno ${purgeCount ?? 0} starih vijesti.\n`);
+
+  // Step 2: Fetch existing (ticker, url) pairs so we don't insert duplicates
+  const { data: existingRows } = await sb.from('stock_news').select('ticker,url');
+  const existingPairs = new Set((existingRows ?? []).map(r => `${r.ticker}|${r.url}`));
+  console.log(`Vec u bazi: ${existingRows?.length ?? 0} vijesti.\n`);
+
+  // Step 3: Fetch RSS feeds
   console.log('Dohvacanje RSS feedova...');
   const allArticles: FeedArticle[] = [];
   for (const feed of RSS_FEEDS) {
     const articles = await fetchFeed(feed.source, feed.url, cutoff);
     allArticles.push(...articles);
   }
-  console.log(`Ukupno ${allArticles.length} svjezih clanaka.\n`);
+  // Deduplicate by URL within this run (vijesti + analize feeds can overlap)
+  const seen = new Set<string>();
+  const uniqueArticles = allArticles.filter(a => {
+    if (seen.has(a.url)) return false;
+    seen.add(a.url);
+    return true;
+  });
+  console.log(`Ukupno ${uniqueArticles.length} svjezih jedinstvenih clanaka.\n`);
 
-  if (!allArticles.length) {
+  if (!uniqueArticles.length) {
     console.log('Nema clanaka — RSS feedovi nisu dostupni ili su prazni.');
     process.exit(0);
   }
 
   let totalInserted = 0;
 
+  // Step 4: For each stock, insert only NEW matching articles
   for (const stock of allStocks as { ticker: string; name: string }[]) {
     const cleaned  = cleanName(stock.name);
-    const matching = allArticles.filter(a => matchesCompany(a, stock.ticker, cleaned));
-
-    const { error: delErr } = await sb.from('stock_news').delete().eq('ticker', stock.ticker);
-    if (delErr) {
-      console.error(`${stock.ticker}: delete greska: ${delErr.message}`);
-      continue;
-    }
+    const matching = uniqueArticles
+      .filter(a => matchesCompany(a, stock.ticker, cleaned))
+      .filter(a => !existingPairs.has(`${stock.ticker}|${a.url}`));  // skip already-stored
 
     if (!matching.length) continue;
 
-    const rows = matching.slice(0, 10).map(a => ({ ...a, ticker: stock.ticker }));
+    const rows = matching.map(a => ({ ...a, ticker: stock.ticker }));
     const { error: insErr } = await sb.from('stock_news').insert(rows);
 
     if (insErr) {
       console.error(`${stock.ticker}: insert greska: ${insErr.message}`);
     } else {
-      console.log(`${stock.ticker} (${cleaned}): ${rows.length} vijesti`);
-      rows.forEach(r =>
-        console.log(`  [${new Date(r.published_at).toLocaleDateString('hr-HR')}] ${r.title.slice(0, 90)} — ${r.source}`)
-      );
+      console.log(`${stock.ticker} (${cleaned}): +${rows.length} novih vijesti`);
+      rows.forEach(r => {
+        console.log(`  [${new Date(r.published_at).toLocaleDateString('hr-HR')}] ${r.title.slice(0, 90)} — ${r.source}`);
+        existingPairs.add(`${stock.ticker}|${r.url}`);
+      });
       totalInserted += rows.length;
     }
   }
 
-  console.log(`\nGotovo! ${totalInserted} vijesti za ${allStocks.length} tickera.`);
+  console.log(`\nGotovo! +${totalInserted} novih vijesti.`);
 }
 
 main().catch(err => { console.error(err); process.exit(1); });
