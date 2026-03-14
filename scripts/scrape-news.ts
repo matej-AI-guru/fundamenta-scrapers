@@ -20,10 +20,10 @@ import { getSupabaseAdmin } from '../lib/supabase';
 const MAX_AGE_DAYS = 90;
 
 const RSS_FEEDS = [
-  { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/rss' },
-  { source: 'Lider',            url: 'https://lidermedia.hr/rss' },
-  { source: 'Bloomberg Adria',  url: 'https://www.bloombergadria.com/rss' },
-  { source: 'Tportal Biznis',   url: 'https://tportal.hr/biznis/rss' },
+  { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/feed' },
+  { source: 'Večernji list',    url: 'https://www.vecernji.hr/feeds/section/biznis' },
+  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/vijesti.php' },
+  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/analize.php' },
 ];
 
 function cleanName(name: string): string {
@@ -32,11 +32,37 @@ function cleanName(name: string): string {
     .trim();
 }
 
+/**
+ * Extract keywords to match from a company name.
+ * "Končar - Elektroindustrija" → ["končar - elektroindustrija", "končar"]
+ * "AD Plastik" → ["ad plastik"]
+ */
+function nameKeywords(cleanedName: string): string[] {
+  const name = cleanedName.toLowerCase();
+  const keywords = [name];
+  // For compound names with separator, also try the first part
+  const firstPart = name.split(/\s*[-–—]\s*/)[0].trim();
+  if (firstPart !== name && firstPart.length >= 3) {
+    keywords.push(firstPart);
+  }
+  return keywords;
+}
+
 interface FeedArticle {
   title: string;
   url: string;
   source: string;
   published_at: string;
+}
+
+function decodeEntities(str: string): string {
+  return str
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'");
 }
 
 function extractLink($el: cheerio.Cheerio<cheerio.AnyNode>, $: cheerio.CheerioAPI): string {
@@ -66,7 +92,7 @@ async function fetchFeed(source: string, feedUrl: string, cutoff: Date): Promise
 
     $('item').each((_i, el) => {
       const $el = $(el);
-      const title = $el.find('title').first().text().trim();
+      const title = decodeEntities($el.find('title').first().text().trim());
       const url = extractLink($el, $);
       const pubDateStr = $el.find('pubDate').first().text().trim();
 
@@ -89,14 +115,14 @@ async function fetchFeed(source: string, feedUrl: string, cutoff: Date): Promise
 
 function matchesCompany(article: FeedArticle, ticker: string, cleanedName: string): boolean {
   const title = article.title.toLowerCase();
-  const name  = cleanedName.toLowerCase();
   const esc   = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  // Long names (>= 5 chars): substring match is safe ("podravka" won't appear inside unrelated words)
-  if (name.length >= 5 && title.includes(name)) return true;
-
-  // Short names or all names: require whole-word match to avoid "aci" inside "reprezentacija"
-  if (new RegExp(`\\b${esc(name)}\\b`).test(title)) return true;
+  for (const keyword of nameKeywords(cleanedName)) {
+    // Long keywords (>= 5 chars): substring match is safe
+    if (keyword.length >= 5 && title.includes(keyword)) return true;
+    // Short keywords: require whole-word match to avoid "aci" inside "reprezentacija"
+    if (new RegExp(`\\b${esc(keyword)}\\b`).test(title)) return true;
+  }
 
   // Also match ticker as standalone word
   if (new RegExp(`\\b${esc(ticker.toLowerCase())}\\b`).test(title)) return true;
@@ -139,7 +165,11 @@ async function main() {
     const cleaned  = cleanName(stock.name);
     const matching = allArticles.filter(a => matchesCompany(a, stock.ticker, cleaned));
 
-    await sb.from('stock_news').delete().eq('ticker', stock.ticker);
+    const { error: delErr } = await sb.from('stock_news').delete().eq('ticker', stock.ticker);
+    if (delErr) {
+      console.error(`${stock.ticker}: delete greska: ${delErr.message}`);
+      continue;
+    }
 
     if (!matching.length) continue;
 
