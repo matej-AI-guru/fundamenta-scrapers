@@ -187,6 +187,9 @@ async function processTicker(
     return;
   }
 
+  // Always delete existing news for this ticker first (full refresh — removes old English articles)
+  await sb.from('stock_news').delete().eq('ticker', ticker);
+
   if (!rows.length) {
     console.log(`  Nema vijesti`);
     return;
@@ -199,9 +202,9 @@ async function processTicker(
 
   const { error } = await sb
     .from('stock_news')
-    .upsert(rows, { onConflict: 'ticker,url' });
+    .insert(rows);
 
-  if (error) console.error(`  Greška pri upsertu:`, error.message);
+  if (error) console.error(`  Greška pri insertu:`, error.message);
   else console.log(`  OK — upsertano ${rows.length} vijesti`);
 }
 
