@@ -1,5 +1,5 @@
 /**
- * Scrape latest ZSE stock news from Croatian financial RSS feeds.
+ * Scrape latest ZSE stock news from Croatian financial RSS feeds + Bing News per ticker.
  * Matches company names against both article title AND description.
  * Accumulates articles over time — only purges those older than MAX_AGE_DAYS.
  *
@@ -29,6 +29,24 @@ const DIRECT_FEEDS = [
   { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/analize.php' },
   { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/izdvojeno.php' },
 ];
+
+// Croatian news domains — used to filter Bing News results
+const CROATIAN_DOMAINS = new Set([
+  'index.hr', 'jutarnji.hr', 'vecernji.hr', 'poslovni.hr', '24sata.hr',
+  'slobodnadalmacija.hr', 'dnevnik.hr', 'rtl.hr', 'hrt.hr', 'net.hr',
+  'tportal.hr', 'telegram.hr', 'direktno.hr', 'novilist.hr',
+  'glas-slavonije.hr', 'lider.media', 'lidermedia.hr', 'bloombergadria.com',
+  'seebiz.eu', 'lupiga.com', 'global.hr', 'nacional.hr', 'express.hr',
+  'hrportfolio.hr', 'mojedionice.com', 'zse.hr',
+]);
+
+function isCroatianDomain(urlStr: string): boolean {
+  try {
+    const hostname = new URL(urlStr).hostname.replace(/^www\./, '');
+    return CROATIAN_DOMAINS.has(hostname) ||
+      [...CROATIAN_DOMAINS].some(d => hostname.endsWith('.' + d));
+  } catch { return false; }
+}
 
 function cleanName(name: string): string {
   return name
@@ -120,6 +138,60 @@ async function fetchFeed(source: string, feedUrl: string, cutoff: Date): Promise
   }
 }
 
+/**
+ * Fetch Bing News RSS for a specific stock.
+ * Bing encodes the real URL inside the redirect link — extract without HTTP round-trip.
+ * Less likely to be blocked from GitHub Actions (both on Azure infrastructure).
+ */
+async function fetchBingNewsForStock(
+  ticker: string,
+  cleanedName: string,
+  cutoff: Date,
+): Promise<FeedArticle[]> {
+  const query = `${cleanedName} ZSE`;
+  const feedUrl = `https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=rss&setLang=hr&cc=HR`;
+
+  try {
+    const resp = await fetch(feedUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FundamentaBot/1.0)' },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!resp.ok) return [];
+
+    const xml = await resp.text();
+    const $ = cheerio.load(xml, { xml: true });
+    const articles: FeedArticle[] = [];
+
+    $('item').each((_i, el) => {
+      const $el = $(el);
+      const title = decodeEntities($el.find('title').first().text().trim());
+      const rawLink = extractLink($el);
+      const pubDateStr = $el.find('pubDate').first().text().trim();
+      const description = stripHtml(decodeEntities($el.find('description').first().text()));
+
+      if (!title || !rawLink) return;
+
+      // Extract real URL from Bing redirect: ?url=https%3a%2f%2f...
+      let url = rawLink;
+      try { url = new URL(rawLink).searchParams.get('url') ?? rawLink; } catch {}
+
+      // Filter to Croatian sources only
+      if (!isCroatianDomain(url)) return;
+
+      const published = pubDateStr ? new Date(pubDateStr) : new Date();
+      if (isNaN(published.getTime()) || published < cutoff) return;
+
+      const sourceName = $el.find('source').first().text().trim() || 'Bing vijesti';
+      articles.push({ title, url, source: sourceName, published_at: published.toISOString(), description });
+    });
+
+    if (articles.length > 0) {
+      console.log(`  [Bing] ${ticker}: ${articles.length} clanaka`);
+    }
+    return articles;
+  } catch { return []; /* blocked or timeout */ }
+}
+
 function matchesCompany(article: FeedArticle, ticker: string, cleanedName: string): boolean {
   const title = article.title.toLowerCase();
   const desc  = (article.description ?? '').toLowerCase();
@@ -195,14 +267,29 @@ async function main() {
   let totalSkipped = 0;
   let totalInserted = 0;
 
-  // Step 4: Per-stock: match title + description, insert only new
+  // Step 4: Per-stock: match direct RSS + Bing News supplement
+  console.log('Obrada dionica + Bing News...');
   for (const stock of allStocks as { ticker: string; name: string }[]) {
     const cleaned = cleanName(stock.name);
-    const matches = uniqueArticles.filter(a => matchesCompany(a, stock.ticker, cleaned));
-    const newMatches = matches.filter(a => !existingPairs.has(`${stock.ticker}|${a.url}`));
-    const alreadyInDb = matches.length - newMatches.length;
 
-    totalMatched += matches.length;
+    // Direct RSS matches
+    const directMatches = uniqueArticles.filter(a => matchesCompany(a, stock.ticker, cleaned));
+
+    // Bing News — targeted per-stock (1 query, real URL from redirect)
+    const bingArticles = await fetchBingNewsForStock(stock.ticker, cleaned, cutoff);
+    const bingMatches = bingArticles.filter(a => matchesCompany(a, stock.ticker, cleaned));
+
+    // Merge, dedup by URL within this stock
+    const seenUrls = new Set<string>();
+    const allMatches: FeedArticle[] = [];
+    for (const a of [...directMatches, ...bingMatches]) {
+      if (!seenUrls.has(a.url)) { seenUrls.add(a.url); allMatches.push(a); }
+    }
+
+    const newMatches = allMatches.filter(a => !existingPairs.has(`${stock.ticker}|${a.url}`));
+    const alreadyInDb = allMatches.length - newMatches.length;
+
+    totalMatched += allMatches.length;
     totalSkipped += alreadyInDb;
 
     if (!newMatches.length) continue;
