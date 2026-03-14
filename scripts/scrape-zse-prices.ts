@@ -159,7 +159,8 @@ async function fetchZseTodayData(isin: string): Promise<ZseDayData | null> {
 
     let priceIdx = -1;
     let turnoverIdx = -1;
-    let lastRow: cheerio.Cheerio<cheerio.Element> | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let lastRow: cheerio.Cheerio<any> | null = null;
 
     $('table').each((_i, tbl) => {
       const headers: string[] = [];
