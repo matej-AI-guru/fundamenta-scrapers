@@ -1,13 +1,17 @@
 /**
- * Fetch daily price history for all ZSE stocks by scraping zse.hr/hr/papir/310.
- * Stores price, turnover (protrgovani iznos u EUR) and change_pct into price_history.
- * Also updates stocks.price and stocks.last_updated with the latest price.
+ * Daily price scraper for ZSE stocks.
  *
- * Modes:
- *   (default)    Daily mode — fetches last 14 days for all tickers, verifies the
- *                previous business day against ZSE, fixes discrepancies and logs them.
- *   --backfill   First-run mode — fetches 5 years year-by-year, compares existing DB
- *                prices with ZSE prices and reports discrepancies, populates turnover/change_pct.
+ * Daily mode (default):
+ *   - Stockanalysis.com → upserts recent prices
+ *   - ZSE page 310 (transaction table) → today's closing price + total turnover
+ *   - change_pct computed from consecutive DB prices
+ *   - Verifies previous business day, logs corrections
+ *
+ * Backfill mode (--backfill):
+ *   - Stockanalysis.com → 5 years of daily prices
+ *   - Computes change_pct from consecutive prices in-memory
+ *   - Upserts everything (price + change_pct, turnover stays NULL for historical)
+ *   - Compares with existing DB prices, reports mismatches
  *
  * Run:
  *   npx tsx scripts/scrape-zse-prices.ts
@@ -28,15 +32,29 @@ import { getSupabaseAdmin } from '../lib/supabase';
 import { SECTORS } from '../lib/sectors';
 
 const TICKERS = Object.keys(SECTORS);
-const DELAY_MS = 600;
+const DELAY_MS = 400;
 const BATCH_SIZE = 500;
 const PRICE_TOLERANCE = 0.02;
 
 // Croatia adopted EUR on 01.01.2023 — historical HRK prices divide by this rate
 const HRK_TO_EUR = 7.53450;
 
+const SA_START_DATE = new Date('2000-01-01').getTime(); // stockanalysis.com history start
+
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function toIsoDate(d: Date): string {
+  return d.toISOString().split('T')[0];
+}
+
+function prevBusinessDay(from: Date = new Date()): Date {
+  const d = new Date(from);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - 1);
+  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() - 1);
+  return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -71,144 +89,114 @@ function tickerToIsin(ticker: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Date helpers
+// Croatian number parser: "1.234,56" → 1234.56
 // ---------------------------------------------------------------------------
-function toIsoDate(d: Date): string {
-  return d.toISOString().split('T')[0];
-}
-
-/** Format date as DD.MM.YYYY for ZSE URL params */
-function toCroDate(iso: string): string {
-  const [y, m, d] = iso.split('-');
-  return `${d}.${m}.${y}`;
-}
-
-function prevBusinessDay(from: Date = new Date()): Date {
-  const d = new Date(from);
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() - 1);
-  while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() - 1);
-  return d;
-}
-
-// ---------------------------------------------------------------------------
-// ZSE HTML scraper
-// ---------------------------------------------------------------------------
-interface ZseTrade {
-  date: string;       // YYYY-MM-DD
-  price: number;      // closing price in EUR
-  turnover: number;   // protrgovani iznos in EUR
-  change_pct: number; // % change that day
-}
-
-/** Parse Croatian number string: "1.234,56" → 1234.56 */
 function parseCroNum(s: string): number {
   const clean = s.replace(/\./g, '').replace(',', '.').trim();
   return parseFloat(clean) || 0;
 }
 
-/** Parse ZSE date "14.03.2025." → "2025-03-14" */
-function parseCroDate(s: string): string | null {
-  const m = s.trim().replace(/\.$/, '').match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
-  if (!m) return null;
-  return `${m[3]}-${m[2]}-${m[1]}`;
-}
-
-/**
- * Fetch and parse the ZSE trade history page for a ticker, for a given date range.
- * URL: https://zse.hr/hr/papir/310?isin={isin}&od={DD.MM.YYYY}&do={DD.MM.YYYY}
- */
-async function fetchZsePage(
-  ticker: string,
-  isin: string,
-  fromIso: string,
-  toIso: string,
-): Promise<ZseTrade[]> {
-  const od = toCroDate(fromIso);
-  const doParam = toCroDate(toIso);
-  const url = `https://zse.hr/hr/papir/310?isin=${isin}&od=${od}&do=${doParam}`;
-
-  const resp = await fetch(url, {
+// ---------------------------------------------------------------------------
+// SOURCE 1: Stockanalysis.com — price history
+// ---------------------------------------------------------------------------
+async function fetchSAPrices(ticker: string): Promise<{ date: string; price: number }[]> {
+  const url = `https://stockanalysis.com/api/symbol/a/ZSE-${ticker}/history?type=chart`;
+  const res = await fetch(url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      Accept: 'text/html,application/xhtml+xml',
-      'Accept-Language': 'hr-HR,hr;q=0.9',
-      Referer: 'https://zse.hr/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      Referer: 'https://stockanalysis.com/',
     },
     signal: AbortSignal.timeout(20_000),
   });
-
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-  const html = await resp.text();
-  const $ = cheerio.load(html);
-
-  // Find the cotation table — ZSE uses a table with class or within a specific section
-  // Look for any table that has "Datum" and "Zadnja" or "Cijena" headers
-  let targetTable: cheerio.Cheerio<cheerio.Element> | null = null;
-  $('table').each((_i, tbl) => {
-    const headerText = $(tbl).find('th,td').first().text().trim().toLowerCase();
-    const text = $(tbl).text().toLowerCase();
-    if (text.includes('zadnja') || text.includes('promet') || text.includes('datum')) {
-      targetTable = $(tbl);
-      return false; // break
-    }
-  });
-
-  if (!targetTable) {
-    // Debug: log a snippet of the page to help identify the table structure
-    console.log(`  [${ticker}] Tablica nije pronađena u HTML-u (${html.length} bytes). Provjeri URL: ${url}`);
-    return [];
-  }
-
-  // Find header row to determine column indices
-  const headers: string[] = [];
-  $(targetTable).find('tr').first().find('th,td').each((_i, th) => {
-    headers.push($(th).text().trim().toLowerCase());
-  });
-
-  const dateIdx    = headers.findIndex(h => h.includes('datum'));
-  const priceIdx   = headers.findIndex(h => h.includes('zadnja') || h.includes('cijena') || h.includes('close'));
-  const turnIdx    = headers.findIndex(h => h.includes('promet') || h.includes('turnover'));
-  const changeIdx  = headers.findIndex(h => h.includes('promjen') || h.includes('change') || h.includes('%'));
-
-  if (dateIdx === -1 || priceIdx === -1) {
-    console.log(`  [${ticker}] Nepoznata zaglavlja tablice: ${headers.join(' | ')}`);
-    return [];
-  }
+  if (!res.ok) throw new Error(`stockanalysis HTTP ${res.status}`);
+  const json = await res.json() as { status: number; data: [number, number][] };
+  if (!json.data || !Array.isArray(json.data)) throw new Error('No data in SA response');
 
   const cutoff2023 = new Date('2023-01-01').getTime();
-  const trades: ZseTrade[] = [];
-
-  $(targetTable).find('tbody tr,tr').each((_i, tr) => {
-    const cells = $(tr).find('td').toArray();
-    if (cells.length < Math.max(dateIdx, priceIdx) + 1) return;
-
-    const dateStr = $(cells[dateIdx]).text().trim();
-    const date = parseCroDate(dateStr);
-    if (!date) return;
-
-    const rawPrice = parseCroNum($(cells[priceIdx]).text());
-    if (rawPrice <= 0) return;
-
-    const rawTurnover = turnIdx !== -1 ? parseCroNum($(cells[turnIdx]).text()) : 0;
-    const rawChangePct = changeIdx !== -1 ? parseCroNum($(cells[changeIdx]).text()) : 0;
-
-    // Convert HRK → EUR for pre-2023 data
-    const tradeTs = new Date(date).getTime();
-    const isHrk = tradeTs < cutoff2023;
-    const price   = isHrk ? rawPrice / HRK_TO_EUR : rawPrice;
-    const turnover = isHrk ? rawTurnover / HRK_TO_EUR : rawTurnover;
-
-    trades.push({
-      date,
-      price:      Math.round(price * 10000) / 10000,
-      turnover:   Math.round(turnover * 100) / 100,
-      change_pct: Math.round(rawChangePct * 10000) / 10000,
+  return json.data
+    .filter(([ts]) => ts >= SA_START_DATE)
+    .map(([ts, rawPrice]) => {
+      const price = ts < cutoff2023 ? rawPrice / HRK_TO_EUR : rawPrice;
+      return {
+        date: new Date(ts).toISOString().split('T')[0],
+        price: Math.round(price * 10000) / 10000,
+      };
     });
-  });
+}
 
-  return trades.sort((a, b) => a.date.localeCompare(b.date));
+// ---------------------------------------------------------------------------
+// SOURCE 2: ZSE page 310 — today's transactions
+// Table columns: r.br. | tvtic | vrijeme | cijena | količina | vrijednost | oznake | kumulativna količina | kumulativni promet
+// Last row = closing price + total daily turnover
+// ---------------------------------------------------------------------------
+interface ZseDayData {
+  price: number;
+  turnover: number;
+}
+
+async function fetchZseTodayData(isin: string): Promise<ZseDayData | null> {
+  const url = `https://zse.hr/hr/papir/310?isin=${isin}`;
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'hr-HR,hr;q=0.9',
+        Referer: 'https://zse.hr/',
+      },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+    const $ = cheerio.load(html);
+
+    // Find the transactions table by looking for "kumulativni promet" in any table
+    let priceIdx = -1;
+    let turnoverIdx = -1;
+    let lastRow: cheerio.Cheerio<cheerio.Element> | null = null;
+
+    $('table').each((_i, tbl) => {
+      const headers: string[] = [];
+      $(tbl).find('tr').first().find('th,td').each((_j, th) => {
+        headers.push($(th).text().trim().toLowerCase());
+      });
+
+      // "kumulativni promet" is in this table
+      const turnIdx = headers.findIndex(h => h.includes('kumulativni promet'));
+      const pIdx = headers.findIndex(h => h === 'cijena');
+      if (turnIdx !== -1 && pIdx !== -1) {
+        priceIdx = pIdx;
+        turnoverIdx = turnIdx;
+        // Get the last data row
+        const rows = $(tbl).find('tbody tr');
+        if (rows.length > 0) {
+          lastRow = rows.last();
+        }
+        return false; // break
+      }
+    });
+
+    if (!lastRow || priceIdx === -1 || turnoverIdx === -1) return null;
+
+    const cells = $(lastRow).find('td').toArray();
+    if (cells.length <= Math.max(priceIdx, turnoverIdx)) return null;
+
+    const price = parseCroNum($(cells[priceIdx]).text());
+    const turnover = parseCroNum($(cells[turnoverIdx]).text());
+
+    if (price <= 0) return null;
+
+    // Convert HRK→EUR if needed (pre-2023 — shouldn't apply for today, but just in case)
+    const today = new Date();
+    const isHrk = today.getFullYear() < 2023;
+    return {
+      price: Math.round((isHrk ? price / HRK_TO_EUR : price) * 10000) / 10000,
+      turnover: Math.round((isHrk ? turnover / HRK_TO_EUR : turnover) * 100) / 100,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +204,7 @@ async function fetchZsePage(
 // ---------------------------------------------------------------------------
 async function upsertBatch(
   sb: ReturnType<typeof getSupabaseAdmin>,
-  records: { ticker: string; date: string; price: number; turnover: number; change_pct: number }[],
+  records: { ticker: string; date: string; price: number; change_pct: number | null; turnover: number | null }[],
 ) {
   for (let i = 0; i < records.length; i += BATCH_SIZE) {
     const batch = records.slice(i, i + BATCH_SIZE);
@@ -228,80 +216,97 @@ async function upsertBatch(
 }
 
 // ---------------------------------------------------------------------------
-// BACKFILL MODE — fetch 5 years year-by-year
+// Compute change_pct from consecutive sorted prices
+// ---------------------------------------------------------------------------
+function computeChangePct(prices: { date: string; price: number }[]): Map<string, number> {
+  const result = new Map<string, number>();
+  for (let i = 1; i < prices.length; i++) {
+    const prev = prices[i - 1].price;
+    const curr = prices[i].price;
+    if (prev > 0) {
+      result.set(prices[i].date, Math.round(((curr - prev) / prev) * 10000 * 100) / 10000);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// BACKFILL MODE
 // ---------------------------------------------------------------------------
 async function runBackfill(sb: ReturnType<typeof getSupabaseAdmin>) {
-  const today = new Date();
-  const currentYear = today.getFullYear();
-  const startYear = currentYear - 5;
+  console.log('\n=== BACKFILL MODE: stockanalysis.com + change_pct ===\n');
 
-  console.log(`\n=== BACKFILL MODE: ${startYear + 1} → ${currentYear} (po godinama) ===\n`);
-
+  let totalOk = 0;
+  let totalFail = 0;
   let totalMismatches = 0;
   let totalUpserted = 0;
 
   for (const ticker of TICKERS) {
-    const isin = tickerToIsin(ticker);
-    console.log(`\n${ticker} (${isin}):`);
-
-    let tickerTotal = 0;
-    let tickerMismatches = 0;
-
-    for (let y = startYear + 1; y <= currentYear; y++) {
-      const fromIso = `${y}-01-01`;
-      const toIso   = y === currentYear ? toIsoDate(today) : `${y}-12-31`;
-
-      try {
-        const trades = await fetchZsePage(ticker, isin, fromIso, toIso);
-
-        if (!trades.length) {
-          console.log(`  ${y}: nema podataka`);
-          await sleep(DELAY_MS);
-          continue;
-        }
-
-        // Compare prices with existing DB records
-        const { data: existing } = await sb
-          .from('price_history')
-          .select('date,price')
-          .eq('ticker', ticker)
-          .gte('date', fromIso)
-          .lte('date', toIso);
-
-        const dbByDate = new Map<string, number>(
-          (existing ?? []).map((r: { date: string; price: number }) => [r.date, r.price]),
-        );
-
-        for (const t of trades) {
-          const dbPrice = dbByDate.get(t.date);
-          if (dbPrice !== undefined && Math.abs(dbPrice - t.price) > PRICE_TOLERANCE) {
-            console.log(`  MISMATCH ${t.date}: DB=${dbPrice.toFixed(4)} ZSE=${t.price.toFixed(4)} Δ=${(t.price - dbPrice).toFixed(4)}`);
-            tickerMismatches++;
-          }
-        }
-
-        const records = trades.map(t => ({ ticker, ...t }));
-        await upsertBatch(sb, records);
-        console.log(`  ${y}: ${trades.length} dana (${trades[0].date} → ${trades[trades.length - 1].date})`);
-        tickerTotal += records.length;
-      } catch (err) {
-        console.log(`  ${y}: GREŠKA — ${err instanceof Error ? err.message : err}`);
+    process.stdout.write(`${ticker}: `);
+    try {
+      const prices = await fetchSAPrices(ticker);
+      if (!prices.length) {
+        console.log('nema podataka');
+        totalFail++;
+        await sleep(DELAY_MS);
+        continue;
       }
 
-      await sleep(DELAY_MS);
-    }
+      // Compare with existing DB
+      const fiveYearsAgo = toIsoDate(new Date(Date.now() - 5 * 365.25 * 24 * 3600 * 1000));
+      const { data: existing } = await sb
+        .from('price_history')
+        .select('date,price')
+        .eq('ticker', ticker)
+        .gte('date', fiveYearsAgo);
 
-    console.log(`  Ukupno: ${tickerTotal} dana, ${tickerMismatches} mismatch-a`);
-    totalMismatches += tickerMismatches;
-    totalUpserted += tickerTotal;
+      const dbByDate = new Map<string, number>(
+        (existing ?? []).map((r: { date: string; price: number }) => [r.date, r.price]),
+      );
+
+      let mismatches = 0;
+      for (const p of prices) {
+        const dbPrice = dbByDate.get(p.date);
+        if (dbPrice !== undefined && Math.abs(dbPrice - p.price) > PRICE_TOLERANCE) {
+          console.log(`\n  MISMATCH ${p.date}: DB=${dbPrice.toFixed(4)} SA=${p.price.toFixed(4)}`);
+          mismatches++;
+        }
+      }
+      totalMismatches += mismatches;
+
+      // Compute change_pct from consecutive prices
+      const changePctMap = computeChangePct(prices);
+
+      const records = prices.map(p => ({
+        ticker,
+        date: p.date,
+        price: p.price,
+        change_pct: changePctMap.get(p.date) ?? null,
+        turnover: null as number | null, // historical turnover not available
+      }));
+
+      await upsertBatch(sb, records);
+      const latest = prices[prices.length - 1];
+      console.log(
+        `${prices.length} dana OK (${prices[0].date} → ${latest.date})` +
+        (mismatches ? ` | ${mismatches} mismatch` : ''),
+      );
+      totalOk++;
+      totalUpserted += records.length;
+    } catch (err) {
+      console.log(`GREŠKA — ${err instanceof Error ? err.message : err}`);
+      totalFail++;
+    }
+    await sleep(DELAY_MS);
   }
 
   console.log(`
 ========================================
 BACKFILL STATISTIKA:
-  Tickera: ${TICKERS.length}
+  OK: ${totalOk} tickera
+  Greški: ${totalFail}
   Upsertano redova: ${totalUpserted}
-  Price mismatch-eva: ${totalMismatches}
+  Price mismatch-eva (posljednjih 5g): ${totalMismatches}
 ========================================`);
 }
 
@@ -311,12 +316,9 @@ BACKFILL STATISTIKA:
 async function runDaily(sb: ReturnType<typeof getSupabaseAdmin>) {
   const today = new Date();
   const toIso = toIsoDate(today);
-  const from14 = new Date(today);
-  from14.setDate(from14.getDate() - 14);
-  const fromIso = toIsoDate(from14);
   const prevBizDay = toIsoDate(prevBusinessDay());
 
-  console.log(`\n=== DAILY MODE: ${fromIso} → ${toIso} (verifikacija: ${prevBizDay}) ===\n`);
+  console.log(`\n=== DAILY MODE (${toIso}, verifikacija: ${prevBizDay}) ===\n`);
 
   let totalOk = 0;
   let totalFail = 0;
@@ -325,37 +327,62 @@ async function runDaily(sb: ReturnType<typeof getSupabaseAdmin>) {
   for (const ticker of TICKERS) {
     const isin = tickerToIsin(ticker);
     process.stdout.write(`${ticker}: `);
-
     try {
-      const trades = await fetchZsePage(ticker, isin, fromIso, toIso);
-
-      if (!trades.length) {
-        console.log('nema novih podataka');
+      // Fetch recent 30 days from stockanalysis.com
+      const allPrices = await fetchSAPrices(ticker);
+      if (!allPrices.length) {
+        console.log('nema podataka (SA)');
         totalFail++;
         await sleep(DELAY_MS);
         continue;
       }
 
-      const records = trades.map(t => ({ ticker, ...t }));
+      // Use only recent data for daily upsert (last 30 days)
+      const cutoffDate = toIsoDate(new Date(Date.now() - 30 * 24 * 3600 * 1000));
+      const recentPrices = allPrices.filter(p => p.date >= cutoffDate);
+
+      // Compute change_pct — need at least one day before the recent window
+      const idx = allPrices.findIndex(p => p.date >= cutoffDate);
+      const withPrev = idx > 0 ? allPrices.slice(idx - 1) : recentPrices;
+      const changePctMap = computeChangePct(withPrev);
+
+      // Fetch today's turnover from ZSE page 310
+      const zseTodayData = await fetchZseTodayData(isin);
+
+      const records = recentPrices.map(p => ({
+        ticker,
+        date: p.date,
+        price: p.price,
+        change_pct: changePctMap.get(p.date) ?? null,
+        turnover: (p.date === toIso && zseTodayData) ? zseTodayData.turnover : null as number | null,
+      }));
+
       await upsertBatch(sb, records);
 
-      const latest = trades[trades.length - 1];
+      const latest = allPrices[allPrices.length - 1];
+
+      // If ZSE had better data for today (closing price + turnover), use it
+      const todayPrice = zseTodayData?.price ?? latest.price;
+      const todayChangePct = changePctMap.get(toIso) ?? changePctMap.get(latest.date) ?? null;
+      const turnoverStr = zseTodayData ? `${(zseTodayData.turnover / 1000).toFixed(1)}K EUR promet` : 'bez prometa';
+
       console.log(
-        `${trades.length} dana OK, zadnji: ${latest.date} ${latest.price.toFixed(2)} EUR` +
-        ` (${latest.change_pct >= 0 ? '+' : ''}${latest.change_pct.toFixed(2)}%)`,
+        `${recentPrices.length} dana OK, zadnji: ${latest.date} ${todayPrice.toFixed(2)} EUR` +
+        (todayChangePct !== null ? ` (${todayChangePct >= 0 ? '+' : ''}${todayChangePct.toFixed(2)}%)` : '') +
+        `, ${turnoverStr}`,
       );
 
-      // Update stocks.price and stocks.last_updated
+      // Update stocks.price + last_updated
       await sb
         .from('stocks')
-        .update({ price: latest.price, last_updated: new Date().toISOString() })
+        .update({ price: todayPrice, last_updated: today.toISOString() })
         .eq('ticker', ticker);
 
       totalOk++;
 
       // Verify previous business day
-      const prevTrade = trades.find(t => t.date === prevBizDay);
-      if (prevTrade) {
+      const prevDbRow = recentPrices.find(p => p.date === prevBizDay);
+      if (prevDbRow) {
         const { data: dbRow } = await sb
           .from('price_history')
           .select('price')
@@ -363,14 +390,14 @@ async function runDaily(sb: ReturnType<typeof getSupabaseAdmin>) {
           .eq('date', prevBizDay)
           .single();
 
-        if (dbRow && Math.abs((dbRow.price as number) - prevTrade.price) > PRICE_TOLERANCE) {
+        if (dbRow && Math.abs((dbRow.price as number) - prevDbRow.price) > PRICE_TOLERANCE) {
           await sb
             .from('price_history')
             .upsert(
-              { ticker, date: prevBizDay, price: prevTrade.price, turnover: prevTrade.turnover, change_pct: prevTrade.change_pct },
+              { ticker, date: prevBizDay, price: prevDbRow.price, change_pct: changePctMap.get(prevBizDay) ?? null, turnover: null },
               { onConflict: 'ticker,date' },
             );
-          console.log(`  KOREKCIJA [${ticker}] ${prevBizDay}: DB=${(dbRow.price as number).toFixed(4)} → ZSE=${prevTrade.price.toFixed(4)}`);
+          console.log(`  KOREKCIJA [${ticker}] ${prevBizDay}: DB=${(dbRow.price as number).toFixed(4)} → SA=${prevDbRow.price.toFixed(4)}`);
           totalCorrected++;
         }
       }
@@ -378,7 +405,6 @@ async function runDaily(sb: ReturnType<typeof getSupabaseAdmin>) {
       console.log(`GREŠKA — ${err instanceof Error ? err.message : err}`);
       totalFail++;
     }
-
     await sleep(DELAY_MS);
   }
 
@@ -397,7 +423,6 @@ STATISTIKA:
 async function main() {
   const sb = getSupabaseAdmin();
   const isBackfill = process.argv.includes('--backfill');
-
   if (isBackfill) {
     await runBackfill(sb);
   } else {
