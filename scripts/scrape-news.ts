@@ -21,13 +21,13 @@ import { getSupabaseAdmin } from '../lib/supabase';
 const MAX_AGE_DAYS = 90;
 
 const DIRECT_FEEDS = [
-  { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/feed' },
-  { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/trzista/feed' },
-  { source: 'Večernji list',    url: 'https://www.vecernji.hr/feeds/section/biznis' },
-  { source: 'Jutarnji list',    url: 'https://www.jutarnji.hr/novac/feed' },
-  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/vijesti.php' },
-  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/analize.php' },
-  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/izdvojeno.php' },
+  { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/feed?posts_per_page=100' },
+  { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/trzista/feed?posts_per_page=100' },
+  { source: 'Večernji list',    url: 'https://www.vecernji.hr/feeds/section/biznis?count=100' },
+  { source: 'Jutarnji list',    url: 'https://www.jutarnji.hr/novac/feed?posts_per_page=100' },
+  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/vijesti.php?limit=100' },
+  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/analize.php?limit=100' },
+  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/izdvojeno.php?limit=100' },
 ];
 
 // Croatian news domains — used to filter Bing News results
@@ -82,11 +82,6 @@ function nameKeywords(cleanedName: string): string[] {
   const firstPart = name.split(/\s*[-–—]\s*/)[0].trim();
   if (firstPart !== name && firstPart.length >= 3) {
     keywords.push(firstPart);
-  }
-  // Multi-word names: add first word if distinctive (≥6 chars), e.g. "Zagrebačka banka" → "zagrebačka"
-  const firstWord = name.split(/\s+/)[0];
-  if (firstWord !== name && firstWord.length >= 6 && !keywords.includes(firstWord)) {
-    keywords.push(firstWord);
   }
   return keywords;
 }
