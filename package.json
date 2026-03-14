@@ -1,0 +1,21 @@
+{
+  "name": "fundamenta-scrapers",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "scrape-news": "npx tsx scripts/scrape-news.ts",
+    "scrape-prices": "npx tsx scripts/upsert-prices.ts",
+    "scrape-dividends": "npx tsx scripts/scrape-dividends.ts",
+    "scrape-annual": "npx tsx scripts/scrape-stockanalysis-annual.ts",
+    "scrape-quarterly": "npx tsx scripts/scrape-stockanalysis-quarterly.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "cheerio": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4.19.2",
+    "typescript": "^5"
+  }
+}
