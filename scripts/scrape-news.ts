@@ -48,6 +48,25 @@ function isCroatianDomain(urlStr: string): boolean {
   } catch { return false; }
 }
 
+const DOMAIN_TO_NAME: Record<string, string> = {
+  'index.hr': 'Index.hr', 'jutarnji.hr': 'Jutarnji list',
+  'vecernji.hr': 'Večernji list', 'poslovni.hr': 'Poslovni dnevnik',
+  '24sata.hr': '24sata', 'slobodnadalmacija.hr': 'Slobodna Dalmacija',
+  'dnevnik.hr': 'Dnevnik.hr', 'hrt.hr': 'HRT', 'tportal.hr': 'tportal',
+  'telegram.hr': 'Telegram', 'novilist.hr': 'Novi list',
+  'glas-slavonije.hr': 'Glas Slavonije', 'lider.media': 'Lider',
+  'lidermedia.hr': 'Lider', 'bloombergadria.com': 'Bloomberg Adria',
+  'seebiz.eu': 'SEEbiz', 'hrportfolio.hr': 'hrportfolio',
+  'mojedionice.com': 'mojedionice.com', 'zse.hr': 'ZSE',
+};
+
+function domainToSourceName(urlStr: string): string {
+  try {
+    const hostname = new URL(urlStr).hostname.replace(/^www\./, '');
+    return DOMAIN_TO_NAME[hostname] ?? hostname;
+  } catch { return 'Nepoznat izvor'; }
+}
+
 function cleanName(name: string): string {
   return name
     .replace(/\s+(d\.d\.|d\.o\.o\.|j\.d\.d\.|j\.t\.d\.?|d\.d)$/gi, '')
@@ -148,48 +167,52 @@ async function fetchBingNewsForStock(
   cleanedName: string,
   cutoff: Date,
 ): Promise<FeedArticle[]> {
-  const query = `${cleanedName} ZSE`;
-  const feedUrl = `https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=rss&setLang=hr&cc=HR`;
+  const queries = [`${cleanedName} ZSE`, cleanedName];
+  const seen = new Set<string>();
+  const articles: FeedArticle[] = [];
 
-  try {
-    const resp = await fetch(feedUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FundamentaBot/1.0)' },
-      signal: AbortSignal.timeout(8_000),
-    });
-    if (!resp.ok) return [];
+  for (const query of queries) {
+    const feedUrl = `https://www.bing.com/news/search?q=${encodeURIComponent(query)}&format=rss&setLang=hr&cc=HR`;
+    try {
+      const resp = await fetch(feedUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FundamentaBot/1.0)' },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!resp.ok) continue;
 
-    const xml = await resp.text();
-    const $ = cheerio.load(xml, { xml: true });
-    const articles: FeedArticle[] = [];
+      const xml = await resp.text();
+      const $ = cheerio.load(xml, { xml: true });
 
-    $('item').each((_i, el) => {
-      const $el = $(el);
-      const title = decodeEntities($el.find('title').first().text().trim());
-      const rawLink = extractLink($el);
-      const pubDateStr = $el.find('pubDate').first().text().trim();
-      const description = stripHtml(decodeEntities($el.find('description').first().text()));
+      $('item').each((_i, el) => {
+        const $el = $(el);
+        const title = decodeEntities($el.find('title').first().text().trim());
+        const rawLink = extractLink($el);
+        const pubDateStr = $el.find('pubDate').first().text().trim();
+        const description = stripHtml(decodeEntities($el.find('description').first().text()));
 
-      if (!title || !rawLink) return;
+        if (!title || !rawLink) return;
 
-      // Extract real URL from Bing redirect: ?url=https%3a%2f%2f...
-      let url = rawLink;
-      try { url = new URL(rawLink).searchParams.get('url') ?? rawLink; } catch {}
+        // Extract real URL from Bing redirect: ?url=https%3a%2f%2f...
+        let url = rawLink;
+        try { url = new URL(rawLink).searchParams.get('url') ?? rawLink; } catch {}
 
-      // Filter to Croatian sources only
-      if (!isCroatianDomain(url)) return;
+        // Filter to Croatian sources only
+        if (!isCroatianDomain(url)) return;
+        if (seen.has(url)) return;
 
-      const published = pubDateStr ? new Date(pubDateStr) : new Date();
-      if (isNaN(published.getTime()) || published < cutoff) return;
+        const published = pubDateStr ? new Date(pubDateStr) : new Date();
+        if (isNaN(published.getTime()) || published < cutoff) return;
 
-      const sourceName = $el.find('source').first().text().trim() || 'Bing vijesti';
-      articles.push({ title, url, source: sourceName, published_at: published.toISOString(), description });
-    });
+        seen.add(url);
+        articles.push({ title, url, source: domainToSourceName(url), published_at: published.toISOString(), description });
+      });
+    } catch { /* blocked or timeout — skip */ }
+  }
 
-    if (articles.length > 0) {
-      console.log(`  [Bing] ${ticker}: ${articles.length} clanaka`);
-    }
-    return articles;
-  } catch { return []; /* blocked or timeout */ }
+  if (articles.length > 0) {
+    console.log(`  [Bing] ${ticker}: ${articles.length} clanaka`);
+  }
+  return articles;
 }
 
 function matchesCompany(article: FeedArticle, ticker: string, cleanedName: string): boolean {
@@ -201,13 +224,13 @@ function matchesCompany(article: FeedArticle, ticker: string, cleanedName: strin
     // Title match (long keywords: substring; short: word-boundary)
     if (keyword.length >= 5 && title.includes(keyword)) return true;
     if (new RegExp(`\\b${esc(keyword)}\\b`).test(title)) return true;
-    // Description match (word-boundary only to avoid false positives in longer text)
-    if (new RegExp(`\\b${esc(keyword)}\\b`).test(desc)) return true;
+    // Description match: only for meaningful keywords (≥5 chars) to avoid
+    // short names like "INA" or "HT" matching unrelated articles
+    if (keyword.length >= 5 && new RegExp(`\\b${esc(keyword)}\\b`).test(desc)) return true;
   }
 
-  // Ticker as standalone word in title or description
-  const tickerPattern = new RegExp(`\\b${esc(ticker.toLowerCase())}\\b`);
-  if (tickerPattern.test(title) || tickerPattern.test(desc)) return true;
+  // Ticker: title only (tickers are short and can false-positive in descriptions)
+  if (new RegExp(`\\b${esc(ticker.toLowerCase())}\\b`).test(title)) return true;
 
   return false;
 }
