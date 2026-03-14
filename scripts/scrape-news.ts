@@ -1,5 +1,6 @@
 /**
  * Scrape latest news for each ZSE stock from Google News RSS.
+ * Filters to Croatian-language sources only; skips articles older than 90 days.
  * Upserts into stock_news table (ticker, url unique).
  *
  * Run:  npx tsx scripts/scrape-news.ts [TICKER]
@@ -20,9 +21,75 @@ import { getSupabaseAdmin } from '../lib/supabase';
 
 const MAX_NEWS_PER_TICKER = 10;
 const DELAY_MS = 1200;
+const MAX_AGE_DAYS = 90;
+
+/** Known Croatian news source names as returned by Google News RSS. */
+const CROATIAN_SOURCE_NAMES = new Set([
+  'Poslovni dnevnik',
+  'Lider',
+  'Bloomberg Adria',
+  'Forbes Hrvatska',
+  'Forbes Croatia',
+  'Večernji list',
+  'Jutarnji list',
+  'Tportal',
+  'Index.hr',
+  'Index',
+  'Dnevnik.hr',
+  'Slobodna Dalmacija',
+  '24sata',
+  'ZSE',
+  'Novi list',
+  'Glas Slavonije',
+  'Nacional',
+  'Netokracija',
+  'Bug',
+  'HRT',
+  'N1',
+  'Direktno.hr',
+  'Poslovni.hr',
+  'Lider media',
+  'Poslovni',
+]);
+
+/** Croatian site domains — used as fallback source-URL matching. */
+const CROATIAN_DOMAINS = [
+  'poslovni.hr',
+  'lidermedia.hr',
+  'bloombergadria.com',
+  'forbes.hr',
+  'vecernji.hr',
+  'jutarnji.hr',
+  'tportal.hr',
+  'index.hr',
+  'zse.hr',
+  'slobodnadalmacija.hr',
+  'dnevnik.hr',
+  '24sata.hr',
+  'novilist.hr',
+  'glas-slavonije.hr',
+  'nacional.hr',
+  'netokracija.com',
+  'bug.hr',
+  'hrt.hr',
+  'n1info.hr',
+  'direktno.hr',
+];
+
+function isCroatianSource(source: string | null, url: string): boolean {
+  if (source && CROATIAN_SOURCE_NAMES.has(source)) return true;
+  return CROATIAN_DOMAINS.some(d => url.includes(d));
+}
 
 function buildRssUrl(query: string): string {
-  return `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=hr&gl=HR&ceid=HR:hr`;
+  const sites = CROATIAN_DOMAINS.map(d => `site:${d}`).join(' OR ');
+  const fullQuery = `"${query}" (${sites})`;
+  return `https://news.google.com/rss/search?q=${encodeURIComponent(fullQuery)}&hl=hr&gl=HR&ceid=HR:hr`;
+}
+
+/** Fallback: no site filter, rely on source blocklist instead. */
+function buildFallbackRssUrl(query: string): string {
+  return `https://news.google.com/rss/search?q=${encodeURIComponent(`"${query}"`)}&hl=hr&gl=HR&ceid=HR:hr`;
 }
 
 function extractLinkFromItem(itemXml: string): string {
@@ -38,24 +105,13 @@ interface NewsRow {
   published_at: string;
 }
 
-async function scrapeNews(ticker: string, companyName: string): Promise<NewsRow[]> {
-  const url = buildRssUrl(`"${companyName}"`);
-
-  const resp = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      Accept: 'application/rss+xml, application/xml, text/xml',
-    },
-  });
-
-  if (!resp.ok) {
-    console.log(`  ${ticker}: HTTP ${resp.status}`);
-    return [];
-  }
-
-  const xml = await resp.text();
+function parseItems(
+  xml: string,
+  ticker: string,
+  cutoff: Date,
+  fallback = false,
+): NewsRow[] {
   const $ = cheerio.load(xml, { xml: true });
-
   const rows: NewsRow[] = [];
 
   $('item').each((_i, el) => {
@@ -70,17 +126,50 @@ async function scrapeNews(ticker: string, companyName: string): Promise<NewsRow[
 
     if (!articleUrl || !rawTitle) return;
 
+    const published = pubDateStr ? new Date(pubDateStr) : null;
+    if (!published || isNaN(published.getTime())) return;
+    if (published < cutoff) return; // skip old articles
+
+    // In fallback mode, only accept Croatian sources
+    if (fallback && !isCroatianSource(source, articleUrl)) return;
+
     const title = source
       ? rawTitle.replace(new RegExp(` - ${source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), '').trim()
       : rawTitle;
-
-    const published = pubDateStr ? new Date(pubDateStr) : null;
-    if (!published || isNaN(published.getTime())) return;
 
     rows.push({ ticker, title, url: articleUrl, source, published_at: published.toISOString() });
   });
 
   return rows;
+}
+
+async function scrapeNews(ticker: string, companyName: string): Promise<NewsRow[]> {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - MAX_AGE_DAYS);
+
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    Accept: 'application/rss+xml, application/xml, text/xml',
+  };
+
+  // Primary: site-filtered query (Croatian sites only)
+  const primaryUrl = buildRssUrl(companyName);
+  const primaryResp = await fetch(primaryUrl, { headers });
+  if (primaryResp.ok) {
+    const xml = await primaryResp.text();
+    const rows = parseItems(xml, ticker, cutoff, false);
+    if (rows.length > 0) return rows;
+  }
+
+  // Fallback: unfiltered query, but filter results to Croatian sources
+  const fallbackUrl = buildFallbackRssUrl(companyName);
+  const fallbackResp = await fetch(fallbackUrl, { headers });
+  if (!fallbackResp.ok) {
+    console.log(`  ${ticker}: HTTP ${fallbackResp.status}`);
+    return [];
+  }
+  const xml = await fallbackResp.text();
+  return parseItems(xml, ticker, cutoff, true);
 }
 
 async function processTicker(
@@ -119,6 +208,16 @@ async function processTicker(
 async function main() {
   const sb = getSupabaseAdmin();
   const targetTicker = process.argv[2]?.toUpperCase();
+
+  // Delete articles older than MAX_AGE_DAYS
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - MAX_AGE_DAYS);
+  const { error: delErr, count } = await sb
+    .from('stock_news')
+    .delete({ count: 'exact' })
+    .lt('published_at', cutoffDate.toISOString());
+  if (delErr) console.error('Greška pri brisanju starih vijesti:', delErr.message);
+  else console.log(`Obrisano ${count ?? 0} starih vijesti (> ${MAX_AGE_DAYS} dana).`);
 
   const { data: allStocks, error } = await sb
     .from('stocks')
