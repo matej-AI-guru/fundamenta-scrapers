@@ -44,5 +44,5 @@ jobs:
         run: |
           echo "### Price Scraper $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -E "(OK|GREŠKA|KOREKCIJA|MISMATCH|BACKFILL|COMPARE|STATISTIKA|USPOREDBA|ZNAČAJN|Upsertano|dana OK|točnih|zaokruži|\[)" /tmp/prices-output.txt >> $GITHUB_STEP_SUMMARY || true
+          cat /tmp/prices-output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
