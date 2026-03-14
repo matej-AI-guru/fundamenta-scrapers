@@ -5,10 +5,14 @@ on:
     - cron: '20 16 * * 1-5'  # weekdays at 16:20 UTC (ZSE closes at ~16:00 CET/15:00 UTC)
   workflow_dispatch:
     inputs:
-      backfill:
-        description: 'Run in backfill mode (fetch 5 years, compare with DB)'
-        type: boolean
-        default: false
+      mode:
+        description: 'Mode: daily (default), compare (diff SA vs DB, no writes), backfill (SA → DB, source of truth)'
+        type: choice
+        options:
+          - daily
+          - compare
+          - backfill
+        default: daily
 
 jobs:
   scrape:
@@ -23,7 +27,10 @@ jobs:
       - name: Run price scraper
         id: scraper
         run: |
-          if [ "${{ github.event.inputs.backfill }}" = "true" ]; then
+          MODE="${{ github.event.inputs.mode || 'daily' }}"
+          if [ "$MODE" = "compare" ]; then
+            npx tsx scripts/scrape-zse-prices.ts --compare 2>&1 | tee /tmp/prices-output.txt; exit ${PIPESTATUS[0]}
+          elif [ "$MODE" = "backfill" ]; then
             npx tsx scripts/scrape-zse-prices.ts --backfill 2>&1 | tee /tmp/prices-output.txt; exit ${PIPESTATUS[0]}
           else
             npx tsx scripts/scrape-zse-prices.ts 2>&1 | tee /tmp/prices-output.txt; exit ${PIPESTATUS[0]}
@@ -37,5 +44,5 @@ jobs:
         run: |
           echo "### Price Scraper $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -E "(OK|GREŠKA|KOREKCIJA|MISMATCH|BACKFILL|STATISTIKA|Upsertano|dana OK|\[)" /tmp/prices-output.txt >> $GITHUB_STEP_SUMMARY || true
+          grep -E "(OK|GREŠKA|KOREKCIJA|MISMATCH|BACKFILL|COMPARE|STATISTIKA|USPOREDBA|ZNAČAJN|Upsertano|dana OK|točnih|zaokruži|\[)" /tmp/prices-output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
