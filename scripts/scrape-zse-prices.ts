@@ -169,9 +169,11 @@ async function upsertBatch(
 // ---------------------------------------------------------------------------
 async function runBackfill(sb: ReturnType<typeof getSupabaseAdmin>) {
   const toDate = toIsoDate(new Date());
-  const fromDate = toIsoDate(
-    new Date(Date.now() - BACKFILL_YEARS * 365.25 * 24 * 3600 * 1000),
-  );
+  // ZSE API holds exactly 5 years of data — request 5y minus 1 day to stay inside the window
+  const fromDateObj = new Date();
+  fromDateObj.setFullYear(fromDateObj.getFullYear() - BACKFILL_YEARS);
+  fromDateObj.setDate(fromDateObj.getDate() + 1);
+  const fromDate = toIsoDate(fromDateObj);
 
   console.log(`\n=== BACKFILL MODE: ${fromDate} → ${toDate} ===\n`);
 
