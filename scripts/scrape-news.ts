@@ -22,9 +22,12 @@ const MAX_AGE_DAYS = 90;
 
 const DIRECT_FEEDS = [
   { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/feed' },
+  { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/trzista/feed' },
   { source: 'Večernji list',    url: 'https://www.vecernji.hr/feeds/section/biznis' },
+  { source: 'Jutarnji list',    url: 'https://www.jutarnji.hr/novac/feed' },
   { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/vijesti.php' },
   { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/analize.php' },
+  { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/izdvojeno.php' },
 ];
 
 function cleanName(name: string): string {
