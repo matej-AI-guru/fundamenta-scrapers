@@ -73,8 +73,9 @@ async function fetchFeed(source: string, feedUrl: string, cutoff: Date): Promise
 
       if (!title || !url) return;
 
-      const published = pubDateStr ? new Date(pubDateStr) : null;
-      if (!published || isNaN(published.getTime()) || published < cutoff) return;
+      // If no pubDate, assume article is recent (feed itself is fresh)
+      const published = pubDateStr ? new Date(pubDateStr) : new Date();
+      if (isNaN(published.getTime()) || published < cutoff) return;
 
       articles.push({ title, url, source, published_at: published.toISOString() });
     });
