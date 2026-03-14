@@ -83,6 +83,11 @@ function nameKeywords(cleanedName: string): string[] {
   if (firstPart !== name && firstPart.length >= 3) {
     keywords.push(firstPart);
   }
+  // Multi-word names: add first word if distinctive (≥6 chars), e.g. "Zagrebačka banka" → "zagrebačka"
+  const firstWord = name.split(/\s+/)[0];
+  if (firstWord !== name && firstWord.length >= 6 && !keywords.includes(firstWord)) {
+    keywords.push(firstWord);
+  }
   return keywords;
 }
 
@@ -235,6 +240,26 @@ function matchesCompany(article: FeedArticle, ticker: string, cleanedName: strin
   return false;
 }
 
+/**
+ * Returns true if two article titles are likely about the same story.
+ * Checks for shared numbers (e.g. "26 milijuna") AND shared content words.
+ */
+function areDuplicates(titleA: string, titleB: string): boolean {
+  const numsA = new Set((titleA.match(/\d{2,}/g) ?? []));
+  const numsB = new Set((titleB.match(/\d{2,}/g) ?? []));
+  const sharedNums = [...numsA].filter(n => numsB.has(n));
+
+  const wordsA = new Set((titleA.toLowerCase().match(/\p{L}{5,}/gu) ?? []));
+  const wordsB = new Set((titleB.toLowerCase().match(/\p{L}{5,}/gu) ?? []));
+  const sharedWords = [...wordsA].filter(w => wordsB.has(w)).length;
+
+  // Same specific number + 2 common words → same story
+  if (sharedNums.length > 0 && sharedWords >= 2) return true;
+  // Or ≥45% Jaccard word overlap
+  const total = wordsA.size + wordsB.size - sharedWords;
+  return total > 0 && sharedWords / total >= 0.45;
+}
+
 async function main() {
   const sb = getSupabaseAdmin();
 
@@ -259,10 +284,31 @@ async function main() {
   if (purgeErr) console.error('Purge greska:', purgeErr.message);
   else console.log(`Ocisceno ${purgeCount ?? 0} starih vijesti.\n`);
 
-  // Step 2: Load existing (ticker, url) pairs to avoid re-inserting
-  const { data: existingRows } = await sb.from('stock_news').select('ticker,url');
+  // Step 2: Load existing rows for dedup and source-name repair
+  const { data: existingRows } = await sb.from('stock_news').select('ticker,url,title,published_at,source');
   const existingPairs = new Set((existingRows ?? []).map(r => `${r.ticker}|${r.url}`));
+  const existingByTicker = new Map<string, { title: string; published_at: string }[]>();
+  for (const r of existingRows ?? []) {
+    if (!existingByTicker.has(r.ticker)) existingByTicker.set(r.ticker, []);
+    existingByTicker.get(r.ticker)!.push({ title: r.title ?? '', published_at: r.published_at ?? '' });
+  }
   console.log(`Vec u bazi: ${existingRows?.length ?? 0} vijesti.\n`);
+
+  // Repair legacy "Bing vijesti" source names using the real article URL
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const staleSource = (existingRows ?? []).filter((r: any) => r.source === 'Bing vijesti');
+  if (staleSource.length) {
+    let fixed = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const row of staleSource as any[]) {
+      const newSource = domainToSourceName(row.url);
+      if (newSource !== 'Nepoznat izvor') {
+        await sb.from('stock_news').update({ source: newSource }).eq('ticker', row.ticker).eq('url', row.url);
+        fixed++;
+      }
+    }
+    if (fixed > 0) console.log(`Popravljen izvor za ${fixed} starih vijesti.\n`);
+  }
 
   // Step 3: Fetch RSS feeds
   console.log('Dohvacanje RSS feedova...');
@@ -302,14 +348,28 @@ async function main() {
     const bingArticles = await fetchBingNewsForStock(stock.ticker, cleaned, cutoff);
     const bingMatches = bingArticles.filter(a => matchesCompany(a, stock.ticker, cleaned));
 
-    // Merge, dedup by URL within this stock
+    // Merge, dedup by URL and near-duplicate title within this stock
     const seenUrls = new Set<string>();
     const allMatches: FeedArticle[] = [];
     for (const a of [...directMatches, ...bingMatches]) {
-      if (!seenUrls.has(a.url)) { seenUrls.add(a.url); allMatches.push(a); }
+      if (seenUrls.has(a.url)) continue;
+      if (allMatches.some(m =>
+        m.published_at.slice(0, 10) === a.published_at.slice(0, 10) &&
+        areDuplicates(m.title, a.title)
+      )) continue;
+      seenUrls.add(a.url);
+      allMatches.push(a);
     }
 
-    const newMatches = allMatches.filter(a => !existingPairs.has(`${stock.ticker}|${a.url}`));
+    const stockExisting = existingByTicker.get(stock.ticker) ?? [];
+    const newMatches = allMatches.filter(a => {
+      if (existingPairs.has(`${stock.ticker}|${a.url}`)) return false;
+      if (stockExisting.some(e =>
+        e.published_at.slice(0, 10) === a.published_at.slice(0, 10) &&
+        areDuplicates(e.title, a.title)
+      )) return false;
+      return true;
+    });
     const alreadyInDb = allMatches.length - newMatches.length;
 
     totalMatched += allMatches.length;
