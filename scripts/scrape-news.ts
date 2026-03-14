@@ -1,5 +1,6 @@
 /**
- * Scrape latest ZSE stock news from Croatian financial RSS feeds + Google News.
+ * Scrape latest ZSE stock news from Croatian financial RSS feeds.
+ * Matches company names against both article title AND description.
  * Accumulates articles over time — only purges those older than MAX_AGE_DAYS.
  *
  * Run:  npx tsx scripts/scrape-news.ts
@@ -19,31 +20,12 @@ import { getSupabaseAdmin } from '../lib/supabase';
 
 const MAX_AGE_DAYS = 90;
 
-// Direct Croatian RSS feeds — reliable from cloud/CI
 const DIRECT_FEEDS = [
   { source: 'Poslovni dnevnik', url: 'https://www.poslovni.hr/feed' },
   { source: 'Večernji list',    url: 'https://www.vecernji.hr/feeds/section/biznis' },
   { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/vijesti.php' },
   { source: 'hrportfolio',      url: 'https://hrportfolio.hr/feed/rss/analize.php' },
 ];
-
-// Croatian news domains — used to filter Google News results
-const CROATIAN_DOMAINS = new Set([
-  'index.hr', 'jutarnji.hr', 'vecernji.hr', 'poslovni.hr', '24sata.hr',
-  'slobodnadalmacija.hr', 'dnevnik.hr', 'rtl.hr', 'hrt.hr', 'net.hr',
-  'tportal.hr', 'telegram.hr', 'direktno.hr', 'novilist.hr',
-  'glas-slavonije.hr', 'lider.media', 'bloombergadria.com',
-  'seebiz.eu', 'lupiga.com', 'global.hr', 'nacional.hr', 'express.hr',
-  'hrportfolio.hr', 'mojedionice.com', 'zse.hr',
-]);
-
-function isCroatianDomain(urlStr: string): boolean {
-  try {
-    const hostname = new URL(urlStr).hostname.replace(/^www\./, '');
-    return CROATIAN_DOMAINS.has(hostname) ||
-      [...CROATIAN_DOMAINS].some(d => hostname.endsWith('.' + d));
-  } catch { return false; }
-}
 
 function cleanName(name: string): string {
   return name
@@ -69,6 +51,7 @@ interface FeedArticle {
   url: string;
   source: string;
   published_at: string;
+  description?: string; // for matching only, not stored in DB
 }
 
 function decodeEntities(str: string): string {
@@ -81,6 +64,10 @@ function decodeEntities(str: string): string {
     .replace(/&apos;/g, "'");
 }
 
+function stripHtml(str: string): string {
+  return str.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractLink($el: any): string {
   const linkText = $el.find('link').first().text().trim();
@@ -90,7 +77,7 @@ function extractLink($el: any): string {
   return $el.find('guid').first().text().trim();
 }
 
-async function fetchDirectFeed(source: string, feedUrl: string, cutoff: Date): Promise<FeedArticle[]> {
+async function fetchFeed(source: string, feedUrl: string, cutoff: Date): Promise<FeedArticle[]> {
   try {
     const resp = await fetch(feedUrl, {
       headers: {
@@ -112,13 +99,14 @@ async function fetchDirectFeed(source: string, feedUrl: string, cutoff: Date): P
       const title = decodeEntities($el.find('title').first().text().trim());
       const url = extractLink($el);
       const pubDateStr = $el.find('pubDate').first().text().trim();
+      const description = stripHtml(decodeEntities($el.find('description').first().text()));
 
       if (!title || !url) return;
 
       const published = pubDateStr ? new Date(pubDateStr) : new Date();
       if (isNaN(published.getTime()) || published < cutoff) return;
 
-      articles.push({ title, url, source, published_at: published.toISOString() });
+      articles.push({ title, url, source, published_at: published.toISOString(), description });
     });
 
     console.log(`  [${source}] ${articles.length} clanaka`);
@@ -129,76 +117,22 @@ async function fetchDirectFeed(source: string, feedUrl: string, cutoff: Date): P
   }
 }
 
-/**
- * Fetch Google News RSS for a specific stock.
- * Uses <source url> attribute for Croatian domain filtering — no redirect resolution needed.
- * Silent fail if Google News is blocked from this IP.
- */
-async function fetchGoogleNewsForStock(
-  ticker: string,
-  cleanedName: string,
-  cutoff: Date,
-): Promise<FeedArticle[]> {
-  const queries = [
-    `"${cleanedName}"`,
-    `${cleanedName} dionice`,
-    `${ticker} ZSE`,
-  ];
-
-  const seen = new Set<string>();
-  const articles: FeedArticle[] = [];
-
-  for (const q of queries) {
-    const feedUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=hr&gl=HR&ceid=HR:hr`;
-    try {
-      const resp = await fetch(feedUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FundamentaBot/1.0)' },
-        signal: AbortSignal.timeout(6_000),
-      });
-      if (!resp.ok) continue;
-
-      const xml = await resp.text();
-      const $ = cheerio.load(xml, { xml: true });
-
-      $('item').each((_i, el) => {
-        const $el = $(el);
-        const title = decodeEntities($el.find('title').first().text().trim());
-        const url = extractLink($el);
-        const pubDateStr = $el.find('pubDate').first().text().trim();
-        // <source url="https://www.poslovni.hr">Poslovni dnevnik</source>
-        const sourceUrl = $el.find('source').attr('url') ?? '';
-
-        if (!title || !url || seen.has(url)) return;
-
-        // Filter to Croatian sources only
-        if (sourceUrl && !isCroatianDomain(sourceUrl)) return;
-
-        const published = pubDateStr ? new Date(pubDateStr) : new Date();
-        if (isNaN(published.getTime()) || published < cutoff) return;
-
-        seen.add(url);
-        const sourceName = $el.find('source').first().text().trim() || 'Google News';
-        articles.push({ title, url, source: sourceName, published_at: published.toISOString() });
-      });
-    } catch { /* blocked or timeout — skip silently */ }
-  }
-
-  return articles;
-}
-
 function matchesCompany(article: FeedArticle, ticker: string, cleanedName: string): boolean {
   const title = article.title.toLowerCase();
+  const desc  = (article.description ?? '').toLowerCase();
   const esc   = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
   for (const keyword of nameKeywords(cleanedName)) {
-    // Long keywords (>= 5 chars): substring match is safe
+    // Title match (long keywords: substring; short: word-boundary)
     if (keyword.length >= 5 && title.includes(keyword)) return true;
-    // Short keywords: require whole-word match to avoid "aci" inside "reprezentacija"
     if (new RegExp(`\\b${esc(keyword)}\\b`).test(title)) return true;
+    // Description match (word-boundary only to avoid false positives in longer text)
+    if (new RegExp(`\\b${esc(keyword)}\\b`).test(desc)) return true;
   }
 
-  // Also match ticker as standalone word
-  if (new RegExp(`\\b${esc(ticker.toLowerCase())}\\b`).test(title)) return true;
+  // Ticker as standalone word in title or description
+  const tickerPattern = new RegExp(`\\b${esc(ticker.toLowerCase())}\\b`);
+  if (tickerPattern.test(title) || tickerPattern.test(desc)) return true;
 
   return false;
 }
@@ -232,52 +166,46 @@ async function main() {
   const existingPairs = new Set((existingRows ?? []).map(r => `${r.ticker}|${r.url}`));
   console.log(`Vec u bazi: ${existingRows?.length ?? 0} vijesti.\n`);
 
-  // Step 3: Fetch direct RSS feeds (all at once)
-  console.log('Dohvacanje direktnih RSS feedova...');
-  const allDirectArticles: FeedArticle[] = [];
+  // Step 3: Fetch RSS feeds
+  console.log('Dohvacanje RSS feedova...');
+  const allArticles: FeedArticle[] = [];
   for (const feed of DIRECT_FEEDS) {
-    const articles = await fetchDirectFeed(feed.source, feed.url, cutoff);
-    allDirectArticles.push(...articles);
+    const articles = await fetchFeed(feed.source, feed.url, cutoff);
+    allArticles.push(...articles);
   }
-  // Deduplicate by URL (vijesti + analize feeds can overlap)
-  const seenDirect = new Set<string>();
-  const uniqueDirectArticles = allDirectArticles.filter(a => {
-    if (seenDirect.has(a.url)) return false;
-    seenDirect.add(a.url);
+
+  // Deduplicate by URL
+  const seen = new Set<string>();
+  const uniqueArticles = allArticles.filter(a => {
+    if (seen.has(a.url)) return false;
+    seen.add(a.url);
     return true;
   });
-  console.log(`Direktni RSS: ${uniqueDirectArticles.length} jedinstvenih clanaka.\n`);
+  console.log(`\nUkupno dohvaceno: ${uniqueArticles.length} jedinstvenih clanaka.\n`);
 
+  if (!uniqueArticles.length) {
+    console.log('UPOZORENJE: Nema clanaka — svi RSS feedovi su nedostupni ili prazni.');
+    process.exit(1);
+  }
+
+  let totalMatched = 0;
+  let totalSkipped = 0;
   let totalInserted = 0;
 
-  // Step 4: Per-stock: match direct RSS + supplement with Google News
-  console.log('Obrada dionica...');
+  // Step 4: Per-stock: match title + description, insert only new
   for (const stock of allStocks as { ticker: string; name: string }[]) {
     const cleaned = cleanName(stock.name);
+    const matches = uniqueArticles.filter(a => matchesCompany(a, stock.ticker, cleaned));
+    const newMatches = matches.filter(a => !existingPairs.has(`${stock.ticker}|${a.url}`));
+    const alreadyInDb = matches.length - newMatches.length;
 
-    // Direct RSS matches for this stock
-    const directMatches = uniqueDirectArticles
-      .filter(a => matchesCompany(a, stock.ticker, cleaned))
-      .filter(a => !existingPairs.has(`${stock.ticker}|${a.url}`));
+    totalMatched += matches.length;
+    totalSkipped += alreadyInDb;
 
-    // Google News supplement — targeted search per stock
-    const gnArticles = await fetchGoogleNewsForStock(stock.ticker, cleaned, cutoff);
-    const googleMatches = gnArticles
-      .filter(a => !existingPairs.has(`${stock.ticker}|${a.url}`));
+    if (!newMatches.length) continue;
 
-    // Merge, dedup by URL within this stock
-    const seenThisStock = new Set<string>();
-    const allMatches: FeedArticle[] = [];
-    for (const a of [...directMatches, ...googleMatches]) {
-      if (!seenThisStock.has(a.url)) {
-        seenThisStock.add(a.url);
-        allMatches.push(a);
-      }
-    }
-
-    if (!allMatches.length) continue;
-
-    const rows = allMatches.map(a => ({ ...a, ticker: stock.ticker }));
+    // Strip description before inserting (not a DB column)
+    const rows = newMatches.map(({ description: _d, ...a }) => ({ ...a, ticker: stock.ticker }));
     const { error: insErr } = await sb.from('stock_news').insert(rows);
 
     if (insErr) {
@@ -292,7 +220,20 @@ async function main() {
     }
   }
 
-  console.log(`\nGotovo! +${totalInserted} novih vijesti.`);
+  console.log(`
+========================================
+STATISTIKA:
+  RSS feedovi: ${uniqueArticles.length} clanaka dohvaceno
+  Matchova po dionicama: ${totalMatched}
+  Vec u bazi (preskoceno): ${totalSkipped}
+  Novo insertano: ${totalInserted}
+========================================`);
+
+  if (uniqueArticles.length > 0 && totalMatched === 0) {
+    console.log('UPOZORENJE: Feedovi rade, ali nijedan clanak nije matchao nijednu dionicu!');
+    console.log('Provjeri matchesCompany() i RSS feed sadrzaj.');
+    process.exit(1);
+  }
 }
 
 main().catch(err => { console.error(err); process.exit(1); });

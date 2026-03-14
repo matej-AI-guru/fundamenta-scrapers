@@ -15,7 +15,17 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - run: npx tsx scripts/scrape-news.ts
+      - name: Run scraper
+        id: scraper
+        run: npx tsx scripts/scrape-news.ts 2>&1 | tee /tmp/scrape-output.txt; exit ${PIPESTATUS[0]}
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      - name: Write job summary
+        if: always()
+        run: |
+          echo "### News Scraper $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E "(clanaka|Matchova|insertano|UPOZORENJE|greska|\[)" /tmp/scrape-output.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
