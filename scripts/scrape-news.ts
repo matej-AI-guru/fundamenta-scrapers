@@ -24,7 +24,6 @@ const RSS_FEEDS = [
   { source: 'Lider',            url: 'https://lidermedia.hr/rss' },
   { source: 'Bloomberg Adria',  url: 'https://www.bloombergadria.com/rss' },
   { source: 'Tportal Biznis',   url: 'https://tportal.hr/biznis/rss' },
-  { source: 'Index.hr',         url: 'https://www.index.hr/rss' },
 ];
 
 function cleanName(name: string): string {
@@ -91,9 +90,16 @@ async function fetchFeed(source: string, feedUrl: string, cutoff: Date): Promise
 function matchesCompany(article: FeedArticle, ticker: string, cleanedName: string): boolean {
   const title = article.title.toLowerCase();
   const name  = cleanedName.toLowerCase();
+  const esc   = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  if (name.length >= 3 && title.includes(name)) return true;
-  if (new RegExp(`\b${ticker.toLowerCase()}\b`).test(title)) return true;
+  // Long names (>= 5 chars): substring match is safe ("podravka" won't appear inside unrelated words)
+  if (name.length >= 5 && title.includes(name)) return true;
+
+  // Short names or all names: require whole-word match to avoid "aci" inside "reprezentacija"
+  if (new RegExp(`\\b${esc(name)}\\b`).test(title)) return true;
+
+  // Also match ticker as standalone word
+  if (new RegExp(`\\b${esc(ticker.toLowerCase())}\\b`).test(title)) return true;
 
   return false;
 }
