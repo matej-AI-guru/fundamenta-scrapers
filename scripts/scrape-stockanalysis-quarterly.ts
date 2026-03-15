@@ -16,6 +16,7 @@ try {
 
 import * as cheerio from 'cheerio';
 import { getSupabaseAdmin } from '../lib/supabase';
+import { mapSaRow } from './_sa-map';
 
 const DUPLICATE_TICKERS: Record<string, string> = {
   ADRS2: 'ADRS',
@@ -84,90 +85,6 @@ async function fetchFinancials(ticker: string, page: 'income' | 'balance' | 'cas
   return result;
 }
 
-const SA_SCALE = 1_000_000;
-const scaleM = (v: number | null) => (v !== null ? Math.round(v * SA_SCALE) : null);
-
-function buildSaData(
-  incomeData: Record<string, Record<string, number | null>>,
-  balanceData: Record<string, Record<string, number | null>>,
-  cfData: Record<string, Record<string, number | null>>,
-  key: string
-): Record<string, Record<string, number | null>> {
-  const section = (data: Record<string, Record<string, number | null>>) =>
-    Object.fromEntries(
-      Object.entries(data)
-        .map(([label, years]) => [label, years[key] !== undefined ? scaleM(years[key]) : null])
-        .filter(([, v]) => v !== undefined)
-    );
-  return {
-    income: section(incomeData),
-    balance: section(balanceData),
-    cashflow: section(cfData),
-  };
-}
-
-function mapRow(
-  incomeData: Record<string, Record<string, number | null>>,
-  balanceData: Record<string, Record<string, number | null>>,
-  cfData: Record<string, Record<string, number | null>>,
-  key: string
-): Partial<Record<string, number | null>> {
-  const g = (data: Record<string, Record<string, number | null>>, label: string) =>
-    data[label]?.[key] ?? null;
-
-  const revenue = scaleM(g(incomeData, 'Revenue') ?? g(incomeData, 'Total Revenue'));
-  const ebit = scaleM(g(incomeData, 'Operating Income'));
-  const depreciation = scaleM(g(cfData, 'Depreciation & Amortization'));
-  const ebitda = ebit !== null && depreciation !== null ? ebit + depreciation : null;
-  const net_profit = scaleM(g(incomeData, 'Net Income'));
-  const profit_before_tax = scaleM(g(incomeData, 'Pretax Income'));
-  const income_tax = scaleM(g(incomeData, 'Income Tax Expense'));
-  const financial_income = scaleM(g(incomeData, 'Interest & Investment Income'));
-  const fin_exp_raw = g(incomeData, 'Interest Expense');
-  const financial_expenses = fin_exp_raw !== null ? scaleM(Math.abs(fin_exp_raw)) : null;
-  const material_costs = scaleM(g(incomeData, 'Cost of Revenue'));
-  const personnel_costs = scaleM(g(incomeData, 'Selling, General & Admin'));
-  const operating_expenses = scaleM(g(incomeData, 'Operating Expenses'));
-  const cash = scaleM(g(balanceData, 'Cash & Equivalents'));
-  const current_assets = scaleM(g(balanceData, 'Total Current Assets'));
-  const total_assets = scaleM(g(balanceData, 'Total Assets'));
-  const current_liabilities = scaleM(g(balanceData, 'Total Current Liabilities'));
-  const long_term_liabilities = scaleM(g(balanceData, 'Long-Term Debt'));
-  const equity = scaleM(g(balanceData, "Shareholders' Equity"));
-  const retained_earnings = scaleM(g(balanceData, 'Retained Earnings'));
-  const share_capital = scaleM(g(balanceData, 'Common Stock'));
-  const receivables = scaleM(g(balanceData, 'Receivables'));
-  const inventories = scaleM(g(balanceData, 'Inventory'));
-  const tangible_assets = scaleM(g(balanceData, 'Property, Plant & Equipment'));
-  const ig = g(balanceData, 'Goodwill');
-  const io = g(balanceData, 'Other Intangible Assets');
-  const intangible_assets = scaleM(ig !== null || io !== null ? (ig ?? 0) + (io ?? 0) : null);
-  const non_current_assets = total_assets !== null && current_assets !== null ? total_assets - current_assets : null;
-  const operating_cash_flow = scaleM(g(cfData, 'Operating Cash Flow'));
-  const capex = scaleM(g(cfData, 'Capital Expenditures'));
-  const free_cash_flow = scaleM(g(cfData, 'Free Cash Flow'));
-  const investing_cash_flow = scaleM(g(cfData, 'Investing Cash Flow'));
-  const financing_cash_flow = scaleM(g(cfData, 'Financing Cash Flow'));
-  const dividends_raw = g(cfData, 'Common Dividends Paid');
-  const dividends_paid = dividends_raw !== null ? scaleM(Math.abs(dividends_raw)) : null;
-  const net_margin = revenue && net_profit !== null ? net_profit / revenue : null;
-
-  return {
-    revenue, ebit, depreciation, net_profit, ebitda,
-    operating_profit: ebit, other_operating_income: null,
-    material_costs, personnel_costs, operating_expenses,
-    financial_income, financial_expenses,
-    profit_before_tax, income_tax,
-    total_assets, equity, current_assets, current_liabilities,
-    long_term_liabilities, cash, receivables, inventories,
-    tangible_assets, intangible_assets, non_current_assets,
-    share_capital, retained_earnings, provisions: null,
-    current_financial_assets: null,
-    operating_cash_flow, capex, free_cash_flow,
-    investing_cash_flow, financing_cash_flow, dividends_paid,
-    net_margin, roe: null, roce: null, current_ratio: null, eps: null,
-  };
-}
 
 async function replicateTicker(sb: ReturnType<typeof getSupabaseAdmin>, sourceTicker: string, destTicker: string) {
   const { data: existing } = await sb.from('stock_financials').select('year, period').eq('ticker', destTicker).neq('period', 'FY');
@@ -227,10 +144,9 @@ async function processTicker(ticker: string, sb: ReturnType<typeof getSupabaseAd
     if (saKeys.has(key)) continue;
     const [yearStr, period] = key.split('_');
     const year = parseInt(yearStr);
-    const mapped = mapRow(incomeData, balanceData, cfData, key);
+    const mapped = mapSaRow(incomeData, balanceData, cfData, key);
     if (mapped.revenue === null && mapped.total_assets === null) continue;
-    const sa_data = buildSaData(incomeData, balanceData, cfData, key);
-    toUpsert.push({ ticker, year, period, source: 'stockanalysis', report_type: 'group', ...mapped, sa_data });
+    toUpsert.push({ ticker, year, period, source: 'stockanalysis', report_type: 'group', ...mapped });
   }
 
   if (!toUpsert.length) { console.log(`  Svi dostupni kvartali već postoje`); return; }
