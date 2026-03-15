@@ -92,6 +92,25 @@ async function fetchFinancials(
 const SA_SCALE = 1_000_000;
 const scaleM = (v: number | null) => (v !== null ? Math.round(v * SA_SCALE) : null);
 
+function buildSaData(
+  incomeData: Record<string, Record<string, number | null>>,
+  balanceData: Record<string, Record<string, number | null>>,
+  cfData: Record<string, Record<string, number | null>>,
+  key: string
+): Record<string, Record<string, number | null>> {
+  const section = (data: Record<string, Record<string, number | null>>) =>
+    Object.fromEntries(
+      Object.entries(data)
+        .map(([label, years]) => [label, years[key] !== undefined ? scaleM(years[key]) : null])
+        .filter(([, v]) => v !== undefined)
+    );
+  return {
+    income: section(incomeData),
+    balance: section(balanceData),
+    cashflow: section(cfData),
+  };
+}
+
 function mapRow(
   incomeData: Record<string, Record<string, number | null>>,
   balanceData: Record<string, Record<string, number | null>>,
@@ -217,7 +236,8 @@ async function processTicker(ticker: string, sb: ReturnType<typeof getSupabaseAd
     if (existingYears.has(year)) continue;
     const mapped = mapRow(incomeData, balanceData, cfData, key);
     if (mapped.revenue === null && mapped.total_assets === null) continue;
-    toUpsert.push({ ticker, year, period: 'FY', source: 'stockanalysis', report_type: 'group', ...mapped });
+    const sa_data = buildSaData(incomeData, balanceData, cfData, key);
+    toUpsert.push({ ticker, year, period: 'FY', source: 'stockanalysis', report_type: 'group', ...mapped, sa_data });
   }
 
   if (!toUpsert.length) { console.log(`  Sve dostupne godine već postoje`); return; }
